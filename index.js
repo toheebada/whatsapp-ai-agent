@@ -89,6 +89,42 @@ async function complete_task(task_description) {
     return `Marked done: "${data[0].task_description}".`;
 }
 
+// ---------- Reminders (sent to the owner only) ----------
+async function set_reminder(message, remind_at) {
+    const when = new Date(remind_at);
+    if (isNaN(when)) return 'Invalid time. Use ISO format like 2026-10-14T09:00:00+01:00.';
+    if (when.getTime() < Date.now() - 60000) return 'That time is already in the past.';
+    console.log(`[SUPABASE] Setting reminder for ${when.toISOString()}: ${message}`);
+    const { error } = await supabase
+        .from('reminders').insert([{ phone_number: OWNER_NUMBER, message, remind_at: when.toISOString() }]);
+    if (error) return `Database error: ${error.message}`;
+    const shown = when.toLocaleString('en-GB', {
+        timeZone: 'Africa/Lagos', weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+    });
+    return `Reminder set for ${shown} (Lagos time): "${message}".`;
+}
+
+async function list_reminders() {
+    const { data, error } = await supabase
+        .from('reminders').select('id, message, remind_at').eq('sent', false).order('remind_at', { ascending: true });
+    if (error) return `Database error: ${error.message}`;
+    if (!data || data.length === 0) return 'No upcoming reminders.';
+    return data.map(r => {
+        const shown = new Date(r.remind_at).toLocaleString('en-GB', {
+            timeZone: 'Africa/Lagos', weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+        });
+        return `#${r.id} | ${shown} | ${r.message}`;
+    }).join('\n');
+}
+
+async function cancel_reminder(id) {
+    const { data, error } = await supabase
+        .from('reminders').delete().eq('id', id).eq('sent', false).select();
+    if (error) return `Database error: ${error.message}`;
+    if (!data || data.length === 0) return `No upcoming reminder with id ${id}.`;
+    return `Cancelled reminder #${id}.`;
+}
+
 // ---------- Permanent chat memory ----------
 async function saveMessageToHistory(phone_number, role, message) {
     const { error } = await supabase.from('chat_history').insert([{ phone_number, role, message }]);
@@ -128,6 +164,14 @@ const tools = [
         { status: { type: 'string', enum: ['pending', 'done', 'all'] } }),
     fn('complete_task', 'Marks a pending task as done. Pass words from the task description.',
         { task_description: { type: 'string' } }, ['task_description']),
+    fn('set_reminder', 'Sets a WhatsApp reminder that will be sent to the user at a future time. Work out remind_at from the current time in the system prompt.',
+        {
+            message: { type: 'string', description: 'What to remind the user about' },
+            remind_at: { type: 'string', description: 'ISO 8601 time with the Lagos offset, e.g. 2026-10-14T09:00:00+01:00' },
+        }, ['message', 'remind_at']),
+    fn('list_reminders', 'Lists upcoming reminders that have not been sent yet.'),
+    fn('cancel_reminder', 'Cancels an upcoming reminder by its id from list_reminders.',
+        { id: { type: 'integer' } }, ['id']),
 ];
 
 async function runTool(name, args) {
@@ -138,6 +182,9 @@ async function runTool(name, args) {
         case 'add_task': return add_task(args.task_description);
         case 'list_tasks': return list_tasks(args.status);
         case 'complete_task': return complete_task(args.task_description);
+        case 'set_reminder': return set_reminder(args.message, args.remind_at);
+        case 'list_reminders': return list_reminders();
+        case 'cancel_reminder': return cancel_reminder(Number(args.id));
         default: return 'Unknown database tool.';
     }
 }
@@ -148,9 +195,10 @@ async function runTool(name, args) {
 
 function systemPrompt() {
     const now = new Date().toLocaleString('en-GB', { timeZone: 'Africa/Lagos' });
+    const iso = new Date(Date.now() + 3600000).toISOString().slice(0, 19) + '+01:00';
     return `You are a personal AI employee for your boss. Be sharp, direct and brief. Replies are read on WhatsApp.
-Current date and time in Lagos: ${now}.
-Use your tools when asked to save, read or list notes, or to add, list or complete tasks. Never claim a tool succeeded unless it returned a result. Never invent notes or tasks.`;
+Current date and time in Lagos: ${now} (ISO: ${iso}).
+Use your tools when asked to save, read or list notes, to add, list or complete tasks, or to set, list or cancel reminders. Reminders only go to the boss himself. Never claim a tool succeeded unless it returned a result. Never invent notes or tasks.`;
 }
 
 async function askAI(chatId, prompt, image) {
@@ -339,6 +387,28 @@ async function sendMorningBriefing() {
 // Every day at 8:00 AM Lagos time
 cron.schedule('0 8 * * *', () => {
     sendMorningBriefing().catch((e) => console.error('[CRON] Briefing failed:', e));
+}, { timezone: 'Africa/Lagos' });
+
+// Every minute: send any reminder that is due. If sending fails (for example the
+// 24-hour window is closed) it stays unsent and is retried on the next minute.
+let checkingReminders = false;
+cron.schedule('* * * * *', async () => {
+    if (checkingReminders) return;
+    checkingReminders = true;
+    try {
+        const { data } = await supabase
+            .from('reminders').select('id, message')
+            .eq('sent', false).lte('remind_at', new Date().toISOString())
+            .order('remind_at', { ascending: true }).limit(20);
+        for (const r of data || []) {
+            const ok = await sendText(OWNER_NUMBER, `Reminder: ${r.message}`);
+            if (ok) await supabase.from('reminders').update({ sent: true }).eq('id', r.id);
+        }
+    } catch (e) {
+        console.error('[CRON] Reminder check failed:', e);
+    } finally {
+        checkingReminders = false;
+    }
 }, { timezone: 'Africa/Lagos' });
 
 // Manual trigger for testing. Needs CRON_SECRET set in the environment.
