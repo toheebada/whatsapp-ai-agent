@@ -125,6 +125,77 @@ async function cancel_reminder(id) {
     return `Cancelled reminder #${id}.`;
 }
 
+// ---------- Expenses ----------
+function lagosToday() {
+    return new Date(Date.now() + 3600000).toISOString().slice(0, 10); // YYYY-MM-DD in Lagos
+}
+
+function periodStart(period) {
+    const today = lagosToday();
+    if (period === 'today') return today;
+    if (period === 'week') { // the last 7 days including today
+        const d = new Date(`${today}T00:00:00Z`);
+        d.setUTCDate(d.getUTCDate() - 6);
+        return d.toISOString().slice(0, 10);
+    }
+    if (period === 'month') return today.slice(0, 8) + '01';
+    return null; // 'all'
+}
+
+const naira = (n) => `₦${Number(n).toLocaleString('en-NG', { maximumFractionDigits: 2 })}`;
+
+async function log_expense(amount, category, description, date) {
+    const value = Number(amount);
+    if (!isFinite(value) || value <= 0) return 'Invalid amount. It must be a positive number.';
+    const spent_at = /^\d{4}-\d{2}-\d{2}$/.test(date || '') ? date : lagosToday();
+    console.log(`[SUPABASE] Logging expense: ${value} - ${category}`);
+    const { data, error } = await supabase
+        .from('expenses')
+        .insert([{ amount: value, category: String(category).toLowerCase().trim(), description: description || '', spent_at }])
+        .select('id').single();
+    if (error) return `Database error: ${error.message}`;
+    return `Logged ${naira(value)} for ${category} on ${spent_at} (expense #${data.id}).`;
+}
+
+async function expense_summary(period = 'month', category) {
+    let q = supabase.from('expenses').select('amount, category');
+    const start = periodStart(period);
+    if (start) q = q.gte('spent_at', start);
+    if (category) q = q.ilike('category', category.trim());
+    const { data, error } = await q;
+    if (error) return `Database error: ${error.message}`;
+    if (!data || data.length === 0) return `No expenses logged for ${period}${category ? ` in ${category}` : ''}.`;
+
+    const byCat = {};
+    let total = 0;
+    for (const e of data) {
+        const amt = Number(e.amount);
+        total += amt;
+        byCat[e.category] = (byCat[e.category] || 0) + amt;
+    }
+    const lines = Object.entries(byCat)
+        .sort((a, b) => b[1] - a[1])
+        .map(([c, v]) => `- ${c}: ${naira(v)}`);
+    const label = { today: 'today', week: 'the last 7 days', month: 'this month', all: 'all time' }[period] || period;
+    return `Spending for ${label}: ${naira(total)} across ${data.length} entries.\n${lines.join('\n')}`;
+}
+
+async function list_expenses(limit = 10) {
+    const { data, error } = await supabase
+        .from('expenses').select('id, amount, category, description, spent_at')
+        .order('spent_at', { ascending: false }).order('id', { ascending: false }).limit(Math.min(Number(limit) || 10, 30));
+    if (error) return `Database error: ${error.message}`;
+    if (!data || data.length === 0) return 'No expenses logged yet.';
+    return data.map(e => `#${e.id} | ${e.spent_at} | ${naira(e.amount)} | ${e.category}${e.description ? ' | ' + e.description : ''}`).join('\n');
+}
+
+async function delete_expense(id) {
+    const { data, error } = await supabase.from('expenses').delete().eq('id', id).select();
+    if (error) return `Database error: ${error.message}`;
+    if (!data || data.length === 0) return `No expense with id ${id}.`;
+    return `Deleted expense #${id}.`;
+}
+
 // ---------- Permanent chat memory ----------
 async function saveMessageToHistory(phone_number, role, message) {
     const { error } = await supabase.from('chat_history').insert([{ phone_number, role, message }]);
@@ -172,6 +243,22 @@ const tools = [
     fn('list_reminders', 'Lists upcoming reminders that have not been sent yet.'),
     fn('cancel_reminder', 'Cancels an upcoming reminder by its id from list_reminders.',
         { id: { type: 'integer' } }, ['id']),
+    fn('log_expense', 'Logs a spending entry in naira. Use a short lowercase category such as transport, food, data, airtime, school, other.',
+        {
+            amount: { type: 'number', description: 'Amount in naira' },
+            category: { type: 'string' },
+            description: { type: 'string', description: 'What it was for' },
+            date: { type: 'string', description: 'YYYY-MM-DD, only if the user names a day other than today' },
+        }, ['amount', 'category']),
+    fn('expense_summary', 'Totals spending for a period, with a breakdown by category. Optionally filter by one category.',
+        {
+            period: { type: 'string', enum: ['today', 'week', 'month', 'all'], description: 'week means the last 7 days' },
+            category: { type: 'string' },
+        }),
+    fn('list_expenses', 'Lists the most recent expense entries with their ids.',
+        { limit: { type: 'integer' } }),
+    fn('delete_expense', 'Deletes one expense entry by id, for example to fix a mistake.',
+        { id: { type: 'integer' } }, ['id']),
 ];
 
 async function runTool(name, args) {
@@ -185,6 +272,10 @@ async function runTool(name, args) {
         case 'set_reminder': return set_reminder(args.message, args.remind_at);
         case 'list_reminders': return list_reminders();
         case 'cancel_reminder': return cancel_reminder(Number(args.id));
+        case 'log_expense': return log_expense(args.amount, args.category, args.description, args.date);
+        case 'expense_summary': return expense_summary(args.period, args.category);
+        case 'list_expenses': return list_expenses(args.limit);
+        case 'delete_expense': return delete_expense(Number(args.id));
         default: return 'Unknown database tool.';
     }
 }
@@ -198,7 +289,7 @@ function systemPrompt() {
     const iso = new Date(Date.now() + 3600000).toISOString().slice(0, 19) + '+01:00';
     return `You are a personal AI employee for your boss. Be sharp, direct and brief. Replies are read on WhatsApp.
 Current date and time in Lagos: ${now} (ISO: ${iso}).
-Use your tools when asked to save, read or list notes, to add, list or complete tasks, or to set, list or cancel reminders. Reminders only go to the boss himself. Never claim a tool succeeded unless it returned a result. Never invent notes or tasks.`;
+Use your tools when asked to save, read or list notes, to add, list or complete tasks, to set, list or cancel reminders, or to log, total, list or delete expenses (amounts are in naira). Reminders only go to the boss himself. Never claim a tool succeeded unless it returned a result. Never invent notes or tasks.`;
 }
 
 async function askAI(chatId, prompt, image) {
