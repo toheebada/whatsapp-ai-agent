@@ -292,11 +292,15 @@ app.get('/webhook', (req, res) => {
 
 // Meta calls this for every incoming message
 app.post('/webhook', (req, res) => {
+    console.log('[WEBHOOK] Meta knocked on the door.');
     if (APP_SECRET) {
         const sig = req.get('x-hub-signature-256') || '';
         const expected = 'sha256=' + crypto.createHmac('sha256', APP_SECRET).update(req.rawBody || '').digest('hex');
         const ok = sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
-        if (!ok) return res.sendStatus(401);
+        if (!ok) {
+            console.error('[SECURITY] Signature check failed. APP_SECRET in Render is probably wrong.');
+            return res.sendStatus(401);
+        }
     }
     res.sendStatus(200); // answer Meta immediately, then do the slow AI work
     handleWebhook(req.body).catch((e) => console.error('Webhook error:', e));
