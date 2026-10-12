@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
+const cron = require('node-cron');
 const Groq = require('groq-sdk');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -220,8 +221,16 @@ async function sendText(to, body) {
             text: { body: String(body).slice(0, 4000) },
         }),
     });
-    if (!res.ok) console.error('[WHATSAPP] Send failed:', res.status, await res.text());
-    else console.log('[REPLY SENT]');
+    if (!res.ok) {
+        const err = await res.text();
+        console.error('[WHATSAPP] Send failed:', res.status, err);
+        if (err.includes('131047')) {
+            console.error('[WHATSAPP] The 24-hour window is closed. Text the bot first, then try again.');
+        }
+        return false;
+    }
+    console.log('[REPLY SENT]');
+    return true;
 }
 
 async function downloadMedia(mediaId) {
@@ -304,6 +313,39 @@ app.post('/webhook', (req, res) => {
     }
     res.sendStatus(200); // answer Meta immediately, then do the slow AI work
     handleWebhook(req.body).catch((e) => console.error('Webhook error:', e));
+});
+
+// ==========================================
+// 6. PROACTIVE MESSAGES (Phase 5)
+// ==========================================
+
+async function sendMorningBriefing() {
+    const tasks = await list_tasks('pending');
+    const date = new Date().toLocaleDateString('en-GB', {
+        timeZone: 'Africa/Lagos', weekday: 'long', day: 'numeric', month: 'long',
+    });
+    let body;
+    if (tasks.startsWith('Database error')) {
+        body = `Good morning. ${date}.\nI could not read your tasks: ${tasks}`;
+    } else if (tasks.startsWith('No ')) {
+        body = `Good morning. ${date}.\nNo pending tasks. Clean slate, so decide what today is for.`;
+    } else {
+        body = `Good morning. ${date}.\nPending tasks:\n${tasks}\n\nPick the one that moves things most and do it first.`;
+    }
+    console.log('[CRON] Sending morning briefing...');
+    await sendText(OWNER_NUMBER, body);
+}
+
+// Every day at 8:00 AM Lagos time
+cron.schedule('0 8 * * *', () => {
+    sendMorningBriefing().catch((e) => console.error('[CRON] Briefing failed:', e));
+}, { timezone: 'Africa/Lagos' });
+
+// Manual trigger for testing. Needs CRON_SECRET set in the environment.
+app.get('/cron/briefing', async (req, res) => {
+    if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) return res.sendStatus(403);
+    await sendMorningBriefing().catch((e) => console.error('[CRON] Briefing failed:', e));
+    res.send('Briefing triggered.');
 });
 
 app.listen(PORT, () => console.log(`Assistant listening on port ${PORT}`));
