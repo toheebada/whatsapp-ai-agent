@@ -196,6 +196,34 @@ async function delete_expense(id) {
     return `Deleted expense #${id}.`;
 }
 
+// ---------- Web research (Groq built-in browser search, gpt-oss models only) ----------
+async function research(question) {
+    console.log(`[RESEARCH] ${question}`);
+    try {
+        const res = await groq.chat.completions.create({
+            model: process.env.GROQ_RESEARCH_MODEL || 'openai/gpt-oss-120b',
+            messages: [
+                {
+                    role: 'system',
+                    content: 'You are a careful research assistant. Search the web, cross-check at least two sources when possible, and answer in under 300 words for WhatsApp: plain text, short paragraphs, no tables. Name your sources by site name and say clearly what is uncertain or disputed. Never invent facts. Today is ' +
+                        new Date().toLocaleDateString('en-GB', { timeZone: 'Africa/Lagos', day: 'numeric', month: 'long', year: 'numeric' }) + '.',
+                },
+                { role: 'user', content: question },
+            ],
+            tools: [{ type: 'browser_search' }],
+            tool_choice: 'required',
+            reasoning_effort: 'medium',
+            temperature: 0.3,
+            max_completion_tokens: 3000,
+        });
+        const text = (res.choices[0].message.content || '').replace(/【[^】]*】/g, '').trim();
+        return text || 'Research returned nothing. Try rephrasing.';
+    } catch (e) {
+        console.error('[RESEARCH] Failed:', e.message);
+        return `Research failed: ${e.message}`;
+    }
+}
+
 // ---------- Permanent chat memory ----------
 async function saveMessageToHistory(phone_number, role, message) {
     const { error } = await supabase.from('chat_history').insert([{ phone_number, role, message }]);
@@ -259,6 +287,8 @@ const tools = [
         { limit: { type: 'integer' } }),
     fn('delete_expense', 'Deletes one expense entry by id, for example to fix a mistake.',
         { id: { type: 'integer' } }, ['id']),
+    fn('research', 'Searches the live web and returns a sourced answer. Use it for anything current, factual, comparative or that needs checking: news, prices, rules, people, events, how-to research. Pass the full question with any context.',
+        { question: { type: 'string', description: 'The complete research question' } }, ['question']),
 ];
 
 async function runTool(name, args) {
@@ -276,6 +306,7 @@ async function runTool(name, args) {
         case 'expense_summary': return expense_summary(args.period, args.category);
         case 'list_expenses': return list_expenses(args.limit);
         case 'delete_expense': return delete_expense(Number(args.id));
+        case 'research': return research(args.question);
         default: return 'Unknown database tool.';
     }
 }
@@ -289,7 +320,7 @@ function systemPrompt() {
     const iso = new Date(Date.now() + 3600000).toISOString().slice(0, 19) + '+01:00';
     return `You are a personal AI employee for your boss. Be sharp, direct and brief. Replies are read on WhatsApp.
 Current date and time in Lagos: ${now} (ISO: ${iso}).
-Use your tools when asked to save, read or list notes, to add, list or complete tasks, to set, list or cancel reminders, or to log, total, list or delete expenses (amounts are in naira). Reminders only go to the boss himself. Never claim a tool succeeded unless it returned a result. Never invent notes or tasks.`;
+Use your tools when asked to save, read or list notes, to add, list or complete tasks, to set, list or cancel reminders, to log, total, list or delete expenses (amounts are in naira), or to research anything current or factual. When research returns, pass its answer on almost word for word and keep the source names. Reminders only go to the boss himself. Never claim a tool succeeded unless it returned a result. Never invent notes or tasks.`;
 }
 
 async function askAI(chatId, prompt, image) {
