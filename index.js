@@ -372,6 +372,34 @@ async function sendText(to, body) {
     return true;
 }
 
+// Sends an approved template. Works even when the 24-hour window is closed.
+// Template variables cannot contain line breaks, so they are flattened here.
+async function sendTemplate(to, name, params = []) {
+    const clean = (t) => String(t).replace(/\s*[\r\n\t]+\s*/g, ' | ').replace(/ {2,}/g, ' ').trim().slice(0, 900) || '-';
+    const res = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            to,
+            type: 'template',
+            template: {
+                name,
+                language: { code: 'en' },
+                components: params.length
+                    ? [{ type: 'body', parameters: params.map((t) => ({ type: 'text', text: clean(t) })) }]
+                    : [],
+            },
+        }),
+    });
+    if (!res.ok) {
+        console.error('[WHATSAPP] Template send failed:', res.status, await res.text());
+        return false;
+    }
+    console.log(`[WHATSAPP] Template "${name}" sent.`);
+    return true;
+}
+
 async function downloadMedia(mediaId) {
     const auth = { Authorization: `Bearer ${WHATSAPP_TOKEN}` };
     const meta = await (await fetch(`${GRAPH}/${mediaId}`, { headers: auth })).json();
@@ -472,7 +500,14 @@ async function sendMorningBriefing() {
         body = `Good morning. ${date}.\nPending tasks:\n${tasks}\n\nPick the one that moves things most and do it first.`;
     }
     console.log('[CRON] Sending morning briefing...');
-    await sendText(OWNER_NUMBER, body);
+    const sent = await sendText(OWNER_NUMBER, body);
+    if (!sent) {
+        console.log('[CRON] Free text failed, trying the approved template...');
+        const summary = tasks.startsWith('No ') ? 'none, clean slate'
+            : tasks.startsWith('Database error') ? 'could not read tasks'
+            : tasks;
+        await sendTemplate(OWNER_NUMBER, 'morning_briefing', [summary]);
+    }
 }
 
 // Every day at 8:00 AM Lagos time
