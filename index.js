@@ -4,6 +4,9 @@ const crypto = require('crypto');
 const cron = require('node-cron');
 const Groq = require('groq-sdk');
 const { createClient } = require('@supabase/supabase-js');
+const { extractText, audioFileName, toWhatsApp, splitMessage } = require('./helpers');
+
+process.on('unhandledRejection', (e) => console.error('[UNHANDLED]', e));
 
 // ==========================================
 // 0. CONFIG (all secrets come from .env or the host's environment settings)
@@ -23,10 +26,24 @@ const OWNER_NUMBER = process.env.OWNER_NUMBER.replace(/\D/g, '');
 const GRAPH = `https://graph.facebook.com/${process.env.GRAPH_VERSION || 'v23.0'}`;
 const PORT = process.env.PORT || 3000;
 
+// Optional settings. Change them in Render's Environment tab if you want something different.
+const BOT_NAME = process.env.BOT_NAME || 'Ayo';
+const OWNER_NAME = process.env.OWNER_NAME || 'Toheeb';
+const OWNER_CONTEXT = process.env.OWNER_CONTEXT ||
+    'He is a student course rep at a nigeria university who runs AET, an academic support group that holds online class sessions and reminds members about upcoming ones. The files he sends are often lecture notes, timetables, past questions and notices.';
+
 const TEXT_MODEL = process.env.GROQ_TEXT_MODEL || 'openai/gpt-oss-120b';
 const VISION_MODEL = process.env.GROQ_VISION_MODEL || 'qwen/qwen3.8-27b';
+const WHISPER_MODEL = process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo';
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'auto'; // set to "auto" to let Whisper guess the language
+const WHISPER_PROMPT = process.env.WHISPER_PROMPT || 'Nigerian English. Words that may come up: AET, CBT, CGPA, FUTMinna, naira, WhatsApp.';
+
 const HISTORY_LIMIT = 10;
 const MAX_TOOL_ROUNDS = 5;
+const MAX_FILE_BYTES = 15 * 1024 * 1024;        // biggest file we will download
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;        // biggest image we send to the vision model
+const DOC_INLINE_CHARS = Number(process.env.DOC_INLINE_CHARS) || 12000; // how much of a new file the AI sees at once
+const DOC_READ_CHARS = Number(process.env.DOC_READ_CHARS) || 12000;     // how much read_document returns per call
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -196,6 +213,46 @@ async function delete_expense(id) {
     return `Deleted expense #${id}.`;
 }
 
+// ---------- Files he sends (PDF, Word, Excel, slides, text) ----------
+async function saveDocument(name, mime, content) {
+    const { data, error } = await supabase
+        .from('documents')
+        .insert([{ name, mime_type: mime || '', content, char_count: content.length }])
+        .select('id').single();
+    if (error) throw new Error(error.message);
+    return data.id;
+}
+
+async function list_documents(limit = 10) {
+    const { data, error } = await supabase
+        .from('documents').select('id, name, char_count, created_at')
+        .order('created_at', { ascending: false }).limit(Math.min(Number(limit) || 10, 30));
+    if (error) return `Database error: ${error.message}`;
+    if (!data || data.length === 0) return 'No files saved yet.';
+    return data.map(d => {
+        const day = new Date(d.created_at).toLocaleDateString('en-GB', { timeZone: 'Africa/Lagos', day: 'numeric', month: 'short' });
+        return `#${d.id} | ${d.name} | ${d.char_count} characters | ${day}`;
+    }).join('\n');
+}
+
+async function read_document(doc, start = 0) {
+    const key = String(doc ?? '').trim().replace(/^#/, '');
+    let q = supabase.from('documents').select('id, name, content, char_count');
+    q = /^\d+$/.test(key)
+        ? q.eq('id', Number(key))
+        : q.ilike('name', `%${key}%`).order('created_at', { ascending: false });
+    const { data, error } = await q.limit(1).maybeSingle();
+    if (error) return `Database error: ${error.message}`;
+    if (!data) return `No saved file matches "${doc}". Use list_documents to see what is saved.`;
+    const from = Math.max(0, Number(start) || 0);
+    const slice = data.content.slice(from, from + DOC_READ_CHARS);
+    const end = from + slice.length;
+    const more = end < data.char_count
+        ? `\n[More available. Call read_document again with doc "${data.id}" and start ${end}.]`
+        : '\n[End of file.]';
+    return `File #${data.id} "${data.name}", characters ${from} to ${end} of ${data.char_count}:\n\n${slice}${more}`;
+}
+
 // ---------- Web research (Groq built-in browser search, gpt-oss models only) ----------
 async function research(question) {
     console.log(`[RESEARCH] ${question}`);
@@ -205,7 +262,7 @@ async function research(question) {
             messages: [
                 {
                     role: 'system',
-                    content: 'You are a careful research assistant. Search the web, cross-check at least two sources when possible, and answer in under 300 words for WhatsApp: plain text, short paragraphs, no tables. Name your sources by site name and say clearly what is uncertain or disputed. Never invent facts. Today is ' +
+                    content: 'You are a careful research assistant. Search the web and cross-check at least two sources when possible. Write like a smart friend explaining it on WhatsApp: the conclusion first, then the key points in short paragraphs, then one line naming your sources by site name. Under 250 words, plain text, no tables, no headings, no em dashes. Say clearly what is uncertain or disputed. Never invent facts. Today is ' +
                         new Date().toLocaleDateString('en-GB', { timeZone: 'Africa/Lagos', day: 'numeric', month: 'long', year: 'numeric' }) + '.',
                 },
                 { role: 'user', content: question },
@@ -216,7 +273,7 @@ async function research(question) {
             temperature: 0.3,
             max_completion_tokens: 3000,
         });
-        const text = (res.choices[0].message.content || '').replace(/【[^】]*】/g, '').trim();
+        const text = toWhatsApp(res.choices[0].message.content || '');
         return text || 'Research returned nothing. Try rephrasing.';
     } catch (e) {
         console.error('[RESEARCH] Failed:', e.message);
@@ -289,6 +346,13 @@ const tools = [
         { id: { type: 'integer' } }, ['id']),
     fn('research', 'Searches the live web and returns a sourced answer. Use it for anything current, factual, comparative or that needs checking: news, prices, rules, people, events, how-to research. Pass the full question with any context.',
         { question: { type: 'string', description: 'The complete research question' } }, ['question']),
+    fn('list_documents', 'Lists files the user sent earlier (PDF, Word, Excel, slides, text) that were saved, newest first, with their ids.',
+        { limit: { type: 'integer' } }),
+    fn('read_document', 'Reads the text of a saved file. Pass its id as a string like "7", or part of its file name. Long files come in pages: pass start to continue where the last page ended.',
+        {
+            doc: { type: 'string', description: 'Document id or part of the file name' },
+            start: { type: 'integer', description: 'Character position to start from, default 0' },
+        }, ['doc']),
 ];
 
 async function runTool(name, args) {
@@ -307,6 +371,8 @@ async function runTool(name, args) {
         case 'list_expenses': return list_expenses(args.limit);
         case 'delete_expense': return delete_expense(Number(args.id));
         case 'research': return research(args.question);
+        case 'list_documents': return list_documents(args.limit);
+        case 'read_document': return read_document(args.doc, args.start);
         default: return 'Unknown database tool.';
     }
 }
@@ -318,12 +384,51 @@ async function runTool(name, args) {
 function systemPrompt() {
     const now = new Date().toLocaleString('en-GB', { timeZone: 'Africa/Lagos' });
     const iso = new Date(Date.now() + 3600000).toISOString().slice(0, 19) + '+01:00';
-    return `You are a personal AI employee for your boss. Be sharp, direct and brief. Replies are read on WhatsApp.
-Current date and time in Lagos: ${now} (ISO: ${iso}).
-Use your tools when asked to save, read or list notes, to add, list or complete tasks, to set, list or cancel reminders, to log, total, list or delete expenses (amounts are in naira), or to research anything current or factual. When research returns, pass its answer on almost word for word and keep the source names. Reminders only go to the boss himself. Never claim a tool succeeded unless it returned a result. Never invent notes or tasks.`;
+    return `You are ${BOT_NAME}, ${OWNER_NAME}'s personal assistant. You text with him on WhatsApp, like a sharp, warm friend who works for him. ${OWNER_CONTEXT}
+
+HOW YOU SOUND
+- Natural and human. Short messages, plain words, contractions. Not corporate, not robotic.
+- Match his mood and language. If he writes casually or in Pidgin, be casual. If he is stressed or focused, stay calm and direct.
+- Lead with the answer or the result, then add detail only if it helps. Most replies are one to four short lines.
+- Never say "As an AI", "I'd be happy to help", "Certainly" or "Great question". No stacked disclaimers.
+- Confirm finished actions the way a person would ("Done, I'll remind you at 3pm", "Saved, that's ₦1,500 on transport"). Include the key detail (time, amount, id) and skip the recap.
+- Be warm but honest. If a plan has a hole, a deadline is tight, or he keeps pushing something off, say so plainly and kindly, then help him fix it.
+- Use an emoji now and then when it fits, not in every message.
+- WhatsApp formatting only: *bold* with single asterisks, _italic_ with underscores. No headings, no tables, no ** and no #. A short list only when you are listing real items.
+- Never use em dashes. Use a comma, a full stop or "and".
+
+HOW YOU WORK
+- Current date and time in Lagos: ${now} (ISO: ${iso}). Times are Lagos time. Money is in naira.
+- Use your tools to save and read notes, manage tasks, set, list and cancel reminders, log and total expenses, research the web, and read files he sent. Reminders only go to him.
+- Never claim a tool worked unless it returned a result. Never invent notes, tasks or file contents. If a tool fails, say what happened in one line.
+- Messages starting with [Voice note] are what he said out loud, transcribed. Transcription can slip on names, numbers and times. If an amount, time or name that matters sounds doubtful, check it with him before saving, and repeat the key detail when you confirm.
+- Messages starting with [File: ...] carry the start of a document he sent. It is saved with an id. If the text says it was cut short, use read_document with start to read further before answering about later parts. For older files, use list_documents and read_document.
+- Photos arrive with the message. Describe or read them as he asks. If a photo or file has dates, deadlines or things to do, offer to save them as reminders or tasks.
+- When research returns, give him the answer in your own voice: conclusion first, key reasons, then the source names in one line.`;
 }
 
-async function askAI(chatId, prompt, image) {
+function friendlyError(e) {
+    if (e?.code === 'TOO_BIG') return "That file is bigger than I can handle (15 MB max). Send a smaller one, or just the pages that matter.";
+    if (e?.status === 429) return "I'm hitting my AI provider's rate limit right now. Give me a minute and send that again.";
+    if (e?.status === 413) return "That's too much for me to take in at once. Try a smaller file, or ask about one part of it.";
+    return "Something broke on my side while handling that. Send it again in a minute. If it keeps happening, check the logs.";
+}
+
+// Turns a voice note into text with Groq's Whisper
+async function transcribe(buffer, mime) {
+    const file = new File([buffer], audioFileName(mime), { type: String(mime || 'audio/ogg').split(';')[0] });
+    const res = await groq.audio.transcriptions.create({
+        file,
+        model: WHISPER_MODEL,
+        temperature: 0,
+        prompt: WHISPER_PROMPT,
+        ...(WHISPER_LANGUAGE !== 'auto' ? { language: WHISPER_LANGUAGE } : {}),
+    });
+    return String(res.text || '').trim();
+}
+
+// historyText is what gets remembered for next time (the full file text is not stored in chat history)
+async function askAI(chatId, prompt, image, historyText) {
     const history = await fetchRecentHistory(chatId);
     const userContent = image
         ? [
@@ -334,14 +439,15 @@ async function askAI(chatId, prompt, image) {
 
     const messages = [{ role: 'system', content: systemPrompt() }, ...history, { role: 'user', content: userContent }];
     const model = image ? VISION_MODEL : TEXT_MODEL;
+    const effort = prompt.startsWith('[File:') ? 'medium' : 'low';
     let reply = null;
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
         let res;
         try {
             res = await groq.chat.completions.create({
-                model, messages, tools, tool_choice: 'auto', temperature: 0.3, max_tokens: 2048,
-                ...(image ? {} : { reasoning_effort: 'low' }),
+                model, messages, tools, tool_choice: 'auto', temperature: 0.6, max_tokens: 3000,
+                ...(image ? {} : { reasoning_effort: effort }),
             });
         } catch (err) {
             if (err?.error?.error?.code === 'tool_use_failed' && round < MAX_TOOL_ROUNDS - 1) continue;
@@ -370,8 +476,9 @@ async function askAI(chatId, prompt, image) {
     }
 
     if (!reply) reply = 'I hit my tool limit on that one. Try rephrasing.';
+    reply = toWhatsApp(reply); // keep memory clean so the style stays consistent
 
-    await saveMessageToHistory(chatId, 'user', image ? `${prompt} [image attached]` : prompt);
+    await saveMessageToHistory(chatId, 'user', historyText || prompt);
     await saveMessageToHistory(chatId, 'assistant', reply);
     return reply;
 }
@@ -403,6 +510,15 @@ async function sendText(to, body) {
     return true;
 }
 
+// Cleans up the text and sends it as one or more WhatsApp messages
+async function sendReply(to, text) {
+    let ok = true;
+    for (const part of splitMessage(toWhatsApp(text))) {
+        ok = (await sendText(to, part)) && ok;
+    }
+    return ok;
+}
+
 // Sends an approved template. Works even when the 24-hour window is closed.
 // Template variables cannot contain line breaks, so they are flattened here.
 async function sendTemplate(to, name, params = []) {
@@ -431,53 +547,196 @@ async function sendTemplate(to, name, params = []) {
     return true;
 }
 
-async function downloadMedia(mediaId) {
+function tooBig() {
+    const e = new Error('File too big');
+    e.code = 'TOO_BIG';
+    return e;
+}
+
+async function downloadMedia(mediaId, maxBytes = MAX_FILE_BYTES) {
     const auth = { Authorization: `Bearer ${WHATSAPP_TOKEN}` };
-    const meta = await (await fetch(`${GRAPH}/${mediaId}`, { headers: auth })).json();
+    const metaRes = await fetch(`${GRAPH}/${mediaId}`, { headers: auth });
+    const meta = await metaRes.json();
+    if (!metaRes.ok || !meta.url) throw new Error(`Media lookup failed: ${JSON.stringify(meta).slice(0, 200)}`);
+    if (meta.file_size && Number(meta.file_size) > maxBytes) throw tooBig();
     const file = await fetch(meta.url, { headers: auth });
-    const buf = Buffer.from(await file.arrayBuffer());
-    return { mimetype: meta.mime_type, data: buf.toString('base64') };
+    if (!file.ok) throw new Error(`Media download failed: ${file.status}`);
+    const buffer = Buffer.from(await file.arrayBuffer());
+    if (buffer.length > maxBytes) throw tooBig();
+    return { buffer, mimetype: meta.mime_type };
+}
+
+// Shows "typing..." and blue ticks while the AI works. Purely cosmetic, so failures are ignored.
+function keepTyping(messageId) {
+    let stopped = false;
+    let warned = false;
+    const ping = async () => {
+        if (stopped) return;
+        try {
+            const res = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    messaging_product: 'whatsapp',
+                    status: 'read',
+                    message_id: messageId,
+                    typing_indicator: { type: 'text' },
+                }),
+            });
+            if (!res.ok && !warned) {
+                warned = true;
+                console.warn('[WHATSAPP] Typing indicator failed:', res.status);
+            }
+        } catch (_) { /* ignore */ }
+    };
+    ping();
+    const timer = setInterval(ping, 20000); // the indicator fades after about 25 seconds
+    return () => { stopped = true; clearInterval(timer); };
+}
+
+const DEFAULT_IMAGE_PROMPT = 'I sent you this image with no message. Work out what it is and help me with it. If it has text, read it. If it has dates, deadlines or things to do, point them out and offer to save them.';
+const DEFAULT_FILE_PROMPT = 'I sent you this file with no message. Tell me briefly what it is and what matters in it. If it has dates, deadlines or things to do, point them out and offer to save them as reminders or tasks.';
+
+async function imageInput(buffer, mimetype, caption) {
+    if (buffer.length > MAX_IMAGE_BYTES) {
+        return { reply: "That image is too big for me to look at. Send it as a normal photo instead of a file, or crop it a bit." };
+    }
+    return {
+        prompt: caption || DEFAULT_IMAGE_PROMPT,
+        image: { mimetype, data: buffer.toString('base64') },
+        history: `[Image] ${caption}`.trim(),
+    };
+}
+
+async function audioInput(buffer, mimetype) {
+    let text;
+    try {
+        text = await transcribe(buffer, mimetype);
+    } catch (e) {
+        console.error('[VOICE] Transcription failed:', e.message);
+        if (e?.status === 429) throw e;
+        return { reply: "I couldn't make sense of that voice note. Try sending it again, or type it out." };
+    }
+    console.log(`[VOICE] Heard: ${text.slice(0, 200)}`);
+    if (!text) return { reply: "I couldn't hear anything in that voice note. Try recording it again?" };
+    return { prompt: `[Voice note] ${text}`, history: `[Voice note] ${text}` };
+}
+
+async function fileInput(doc) {
+    const name = doc.filename || 'file';
+    const mime = String(doc.mime_type || '').split(';')[0];
+    const caption = doc.caption || '';
+
+    const media = await downloadMedia(doc.id);
+    // A photo or voice note sent "as a file" still gets treated as a photo or voice note
+    if (mime.startsWith('image/')) return imageInput(media.buffer, mime, caption);
+    if (mime.startsWith('audio/')) return audioInput(media.buffer, mime);
+
+    const out = await extractText(media.buffer, mime, name);
+    if (out.error) return { reply: out.error };
+
+    let id = null;
+    try {
+        id = await saveDocument(name, mime, out.text);
+    } catch (e) {
+        console.error('[DOCS] Could not save the file. Did you run documents.sql in Supabase?', e.message);
+    }
+
+    const shown = out.text.slice(0, DOC_INLINE_CHARS);
+    const cut = shown.length < out.text.length;
+    const label = id ? `document #${id}` : 'not saved for later';
+    const notes = [];
+    if (cut && id) notes.push(`(Cut short here. To read more, call read_document with doc "${id}" and start ${shown.length}.)`);
+    if (cut && !id) notes.push('(Cut short here and it could not be saved, so the rest is not available.)');
+    if (out.truncated) notes.push(`(The file is very long, so only its first ${out.text.length} of ${out.totalChars} characters were kept.)`);
+
+    const prompt = `[File: ${name}, ${label}, ${out.text.length} characters]
+${notes.length ? notes.join('\n') + '\n' : ''}
+${shown}
+[End of the text shown]
+
+${caption || DEFAULT_FILE_PROMPT}`;
+    return { prompt, history: `[File: ${name}, ${label}] ${caption}`.trim() };
+}
+
+// Works out what the AI should see for each kind of WhatsApp message
+async function buildInput(msg) {
+    switch (msg.type) {
+        case 'text':
+            return { prompt: msg.text.body, history: msg.text.body };
+        case 'image': {
+            const media = await downloadMedia(msg.image.id);
+            return imageInput(media.buffer, [msg.image.mime_type, media.mimetype].find((m) => /^image\//.test(m || '')) || 'image/jpeg', msg.image.caption || '');
+        }
+        case 'audio': {
+            const media = await downloadMedia(msg.audio.id);
+            return audioInput(media.buffer, media.mimetype || msg.audio.mime_type);
+        }
+        case 'document':
+            return fileInput(msg.document);
+        case 'video':
+            return { reply: "I can't watch videos yet. If the audio is what matters, send it as a voice note, or tell me what's in it." };
+        case 'reaction':
+        case 'sticker':
+        case 'unsupported':
+            return null; // nothing to answer
+        default:
+            return { reply: "I can read text, voice notes, photos and files (PDF, Word, Excel, PowerPoint, text). That one is outside what I can do for now." };
+    }
 }
 
 const seen = new Set(); // Meta retries webhooks, so we skip message ids we already handled
 
-async function handleWebhook(body) {
-    const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!msg) return; // delivery and read receipts land here, ignore them
-
-    if (seen.has(msg.id)) return;
+async function processMessage(msg) {
+    if (!msg || seen.has(msg.id)) return;
     seen.add(msg.id);
     if (seen.size > 500) seen.delete(seen.values().next().value);
 
-    const from = msg.from;
-    if (from !== OWNER_NUMBER) {
+    if (msg.from !== OWNER_NUMBER) {
         console.log('[SECURITY] Ignored a message from a number that is not the owner.');
         return;
     }
 
-    let prompt = '';
-    let image = null;
-    if (msg.type === 'text') {
-        prompt = msg.text.body;
-    } else if (msg.type === 'image') {
-        prompt = msg.image.caption || 'Describe this image.';
-        image = await downloadMedia(msg.image.id);
-    } else {
-        await sendText(from, 'I can read text and images for now.');
-        return;
-    }
-
-    console.log(`[USER (${from})]: ${prompt}`);
-
-    let reply;
+    const stopTyping = keepTyping(msg.id);
     try {
-        // "@c.us" keeps your old chat memory from the whatsapp-web.js days
-        reply = await askAI(`${from}@c.us`, prompt, image);
-    } catch (e) {
-        console.error('AI Error:', e);
-        reply = 'Something went wrong on my side. Try again in a moment.';
+        let input;
+        try {
+            input = await buildInput(msg);
+        } catch (e) {
+            console.error('[INPUT] Could not read the message:', e.message);
+            await sendReply(msg.from, friendlyError(e));
+            return;
+        }
+        if (!input) return;
+        if (input.reply) {
+            await sendReply(msg.from, input.reply);
+            return;
+        }
+
+        console.log(`[USER (${msg.from})]: ${input.history.slice(0, 200)}`);
+
+        let reply;
+        try {
+            // "@c.us" keeps your old chat memory from the whatsapp-web.js days
+            reply = await askAI(`${msg.from}@c.us`, input.prompt, input.image, input.history);
+        } catch (e) {
+            console.error('AI Error:', e);
+            reply = friendlyError(e);
+        }
+        await sendReply(msg.from, reply);
+    } finally {
+        stopTyping();
     }
-    await sendText(from, reply);
+}
+
+async function handleWebhook(body) {
+    for (const entry of body?.entry || []) {
+        for (const change of entry?.changes || []) {
+            for (const msg of change?.value?.messages || []) {
+                await processMessage(msg).catch((e) => console.error('Message error:', e));
+            }
+        }
+    }
 }
 
 // ==========================================
@@ -514,7 +773,7 @@ app.post('/webhook', (req, res) => {
 });
 
 // ==========================================
-// 6. PROACTIVE MESSAGES (Phase 5)
+// 6. PROACTIVE MESSAGES
 // ==========================================
 
 async function sendMorningBriefing() {
@@ -522,13 +781,14 @@ async function sendMorningBriefing() {
     const date = new Date().toLocaleDateString('en-GB', {
         timeZone: 'Africa/Lagos', weekday: 'long', day: 'numeric', month: 'long',
     });
+    const hello = `Good morning ${OWNER_NAME} ☀️\n${date}.`;
     let body;
     if (tasks.startsWith('Database error')) {
-        body = `Good morning. ${date}.\nI could not read your tasks: ${tasks}`;
+        body = `${hello}\n\nI couldn't read your tasks this morning: ${tasks}`;
     } else if (tasks.startsWith('No ')) {
-        body = `Good morning. ${date}.\nNo pending tasks. Clean slate, so decide what today is for.`;
+        body = `${hello}\n\nNothing pending right now. Clean slate, so decide what today is for.`;
     } else {
-        body = `Good morning. ${date}.\nPending tasks:\n${tasks}\n\nPick the one that moves things most and do it first.`;
+        body = `${hello}\n\nOn your list:\n${tasks}\n\nPick the one that moves things most and start there.`;
     }
     console.log('[CRON] Sending morning briefing...');
     const sent = await sendText(OWNER_NUMBER, body);
@@ -558,7 +818,7 @@ cron.schedule('* * * * *', async () => {
             .eq('sent', false).lte('remind_at', new Date().toISOString())
             .order('remind_at', { ascending: true }).limit(20);
         for (const r of data || []) {
-            const ok = await sendText(OWNER_NUMBER, `Reminder: ${r.message}`);
+            const ok = await sendText(OWNER_NUMBER, `⏰ Reminder: ${r.message}`);
             if (ok) await supabase.from('reminders').update({ sent: true }).eq('id', r.id);
         }
     } catch (e) {
