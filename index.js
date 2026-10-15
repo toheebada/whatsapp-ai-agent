@@ -30,7 +30,7 @@ const PORT = process.env.PORT || 3000;
 const BOT_NAME = process.env.BOT_NAME || 'Ayo';
 const OWNER_NAME = process.env.OWNER_NAME || 'Toheeb';
 const OWNER_CONTEXT = process.env.OWNER_CONTEXT ||
-    'He is a student course rep at a nigeria university who runs AET, an academic support group that holds online class sessions and reminds members about upcoming ones. The files he sends are often lecture notes, timetables, past questions and notices.';
+    'He is a student who is a course rep at a nigeria university who runs AET, an academic support group that holds online class sessions and reminds members about upcoming ones. The files he sends are often lecture notes, timetables, past questions and notices.';
 
 const TEXT_MODEL = process.env.GROQ_TEXT_MODEL || 'openai/gpt-oss-120b';
 const VISION_MODEL = process.env.GROQ_VISION_MODEL || 'qwen/qwen3.8-27b';
